@@ -1,0 +1,341 @@
+with zldb_trx
+as
+(
+	select
+	rot_item,
+	CURR_STATUS,
+	DOC_NUMBER,
+	doc_item,
+	row_num = ROW_NUMBER() over ( partition by rot_item , curr_status order by updated_on desc , updated_at desc) ,
+	UPDATED_ON,
+	UPDATED_AT
+	from EDW_STG_SAP_ECC_DAILY..ZLDB_M_RTBL_TRX
+	where CURR_STATUS in ('ST' , 'STC', 'WOC' , 'WIP')
+) ,
+stg_vbfa
+as
+(
+	SELECT
+	 VBELV,
+	 POSNV,
+	 VBELN,
+	 POSNN,
+	 VBTYP_N,
+	 row_num = row_number() over (partition by VBELV, POSNV , VBTYP_N order by erdat desc)
+	 FROM EDW_STG_SAP_ECC_DAILY..VBFA
+),
+EKBE
+as
+(
+	select
+	EBELN,
+	EBELP,
+	BEWTP,
+	BELNR,
+	BUZEI,
+	BUDAT,
+	row_num = ROW_NUMBER() over (partition by ebeln , ebelp ,bewtp order by budat desc)
+	from EDW_STG_SAP_ECC_DAILY..ekbe
+),
+acv
+as
+(
+	select 
+	anlc.ANLN1,
+	anlc.anln2,
+	anlc.AFABE,
+	anlc.BUKRS,
+	sum(anlc.ANSWL) answl
+	FROM EDW_STG_SAP_ECC_DAILY..anlc anlc
+	where anlc.AFABE = '1'
+	and anlc.BUKRS = 1000
+	group by 
+	anlc.ANLN1,
+	anlc.anln2,
+	anlc.AFABE,
+	anlc.BUKRS
+),
+dep
+as
+(
+	select
+	anlc.ANLN1,
+	anlc.anln2,
+	anlc.AFABE,
+	anlc.BUKRS,
+	sum(anlc.NAFAG) * -1 nafag
+	FROM EDW_STG_SAP_ECC_DAILY..anlc anlc
+	where anlc.AFABE = '1'
+	and anlc.BUKRS = 1000
+	group by 
+	anlc.ANLN1,
+	anlc.anln2,
+	anlc.AFABE,
+	anlc.BUKRS
+),
+p
+as
+(
+	SELECT
+	REF.MAT_REF , --1
+	mat.material_code , --2
+	mst.matnr ,
+	MST.CURR_STATUS , --3
+	MST.BWTAR , --4
+	MST.LGORT , --5
+	RIGHT(mat.Material_Code,2) manufacturer_code ,--6
+	MST.WERKS , --7
+	TW.NAME1 , --8
+	MST.ROT_ITEM , --9
+	REF.FAMILY , --10
+	REF.MAJ_MIN , --11
+	REF.MODEL , --12
+	REF.APP_PREFIX , --13
+	REF.SMCS , --14
+	REF.COMP , --15
+	REF.[MOD] , --16
+	ALC.BSTKD_C1 , --17
+	iif(alc.BSTKD_C1 in (null , '') , null , ALC.SCHD_DATE_C1) scheduled_date1, --18
+	ALC.UNIT_NO_C1 , --19
+	alc.SERNR_C1 , --20
+	alc.WERKS_C1 , --21
+	TW1.NAME1 NAME2 , --22
+	alc.KUNNR_C1 , --23
+	objk.SERNR , --24
+	objk.EQUNR , --24.2
+	rank_rot_item = ROW_NUMBER() over (partition by MST.ROT_ITEM order by MST.ROT_ITEM),
+	rank_tuid = ROW_NUMBER() over (partition by objk.SERNR order by MST.ROT_ITEM , objk.sernr)
+	FROM EDW_STG_SAP_ECC_DAILY..ZLDB_M_RTBL_MSTR MST
+	LEFT JOIN EDW_STG_SAP_ECC_DAILY..ZLDB_M_RTBL_REF REF
+		ON REF.MATNR = MST.MATNR
+	left join edw_mds.ecc.mt_material mat
+		on mat.material_no = mst.matnr
+	LEFT JOIN EDW_STG_SAP_ECC_DAILY..T001W TW
+		ON TW.WERKS = MST.WERKS
+	LEFT JOIN EDW_STG_SAP_ECC_DAILY..ZLDB_M_RTBL_ALLC ALC
+		ON ALC.ROT_ITEM = MST.ROT_ITEM
+	LEFT JOIN EDW_STG_SAP_ECC_DAILY..T001W TW1
+		on tw1.WERKS = alc.WERKS_C1
+	left join zldb_trx trx
+	on trx.ROT_ITEM = mst.ROT_ITEM
+	and trx.CURR_STATUS = mst.CURR_STATUS
+	and trx.row_num = 1
+	LEFT join stg_vbfa vbfa
+	 on vbfa.vbelv = trx.doc_number
+	 and vbfa.posnv = trx.doc_item
+	 and vbfa.VBTYP_N = 'J'
+	 and vbfa.row_num = 1
+	left join EKBE EKBE
+	on ekbe.EBELN = trx.DOC_NUMBER
+	and ekbe.EBELP = trx.DOC_ITEM
+	and ekbe.BEWTP = 'L'
+	and ekbe.row_num = 1
+	left join EDW_STG_SAP_ECC_DAILY..SER01 SER
+	on ser.LIEF_NR = case
+						when trx.CURR_STATUS in ('WOC' , 'WIP' ) then vbfa.VBELN
+						when trx.CURR_STATUS in ('ST' , 'STC' ) then EKBE.BELNR
+					end
+	and ser.POSNR = case
+						when trx.CURR_STATUS in ('WOC' , 'WIP' ) then VBFA.POSNN
+						when trx.CURR_STATUS in ('ST' , 'STC' ) then EKBE.BUZEI
+					end
+	left join EDW_STG_SAP_ECC_DAILY..OBJK OBJK
+	on objk.OBKNR = ser.OBKNR
+),
+EQUI
+as
+(
+	select 
+	equi.EQUNR ,
+	equi.MATNR ,
+	eqbs.B_WERK,
+	eqbs.B_CHARGE,
+	eqbs.B_LAGER ,
+	row_num = ROW_NUMBER() over (partition by  equi.MATNR , eqbs.B_WERK , eqbs.B_LAGER , eqbs.B_CHARGE order by equi.EQUNR desc),
+	equi.SERNR
+	from EDW_STG_SAP_ECC_DAILY..EQUI EQUI
+	left join EDW_STG_SAP_ECC_DAILY..EQBS EQBS
+		on equi.equnr = eqbs.equnr
+	where equi.SERNR not in ( 
+	select p.sernr
+	from p
+	where p.sernr is not null
+	)
+),
+poin24
+as
+(
+	select 
+	p.MAT_REF ref_material_number, --1
+	p.material_code material_number, --2
+	p.matnr matnr,
+	p.CURR_STATUS current_status, --3
+	p.BWTAR valuation_type, --4
+	p.LGORT storage_location, --5
+	p.manufacturer_code ,--6
+	p.WERKS plant, --7
+	p.NAME1 plant_name, --8
+	p.ROT_ITEM rotable_item_number, --9
+	p.FAMILY family, --10
+	p.MAJ_MIN section, --11
+	p.MODEL model, --12
+	p.APP_PREFIX prefix, --13
+	p.SMCS smcs, --14
+	p.COMP component, --15
+	p.[MOD] [mod], --16
+	p.BSTKD_C1 customer_po_number1, --17
+	p.scheduled_date1, --18
+	p.UNIT_NO_C1 Unit_Number_1, --19
+	p.SERNR_C1 serial_number1, --20
+	p.WERKS_C1 location1, --21
+	p.NAME2 plant_name1, --22
+	p.KUNNR_C1 customer_number1, --23
+	p.SERNR tuid, --24
+	p.EQUNR EQUNR, --24.2
+	row_num = ROW_NUMBER() over (partition by p.matnr , p.werks, p.lgort , p.bwtar order by p.SERNR),
+	dupe_tuid = row_number() over (partition by p.sernr order by p.sernr)
+	from p
+	WHERE 1=1
+	and p.rank_rot_item = p.rank_tuid or SERNR is null
+)
+
+
+select
+poin24.ref_material_number, --1
+poin24.material_number, --2
+--poin24.matnr,
+poin24.current_status, --3
+poin24.valuation_type, --4
+poin24.storage_location, --5
+poin24.manufacturer_code ,--6
+poin24.plant, --7
+poin24.plant_name, --8
+poin24.rotable_item_number, --9
+poin24.family, --10
+poin24.section, --11
+poin24.model, --12
+poin24.prefix, --13
+poin24.smcs, --14
+poin24.component, --15
+poin24.[mod], --16
+poin24.customer_po_number1, --17
+poin24.scheduled_date1, --18
+poin24.unit_number_1, --19
+poin24.serial_number1, --20
+poin24.location1, --21
+poin24.plant_name1, --22
+poin24.customer_number1, --23
+iif(poin24.dupe_tuid = 1 , coalesce(poin24.tuid,EQUI.SERNR) , equi.sernr) tuid, --24
+ILOa.ANLNR asset_no, --25
+CASE
+	when poin24.manufacturer_code = 'PE' THEN mbew.STPRS
+	when poin24.manufacturer_code = 'PX' THEN mbew1.STPRS
+	else 0
+END as px_product_sap, --26
+CASE
+	WHEN poin24.valuation_type not IN ('PXPRODUCT','PEPRODUCT') THEN mbew2.STPRS
+	else 0
+end as core_only, -- 27
+isnull(mbew3.STPRS , 0 ) pxbfail_cort, --28
+isnull(mbew4.STPRS , 0 ) pxsfail_cort, --29
+CASE
+	WHEN poin24.current_status in ('OH','ST')
+		and poin24.manufacturer_code = 'PE'
+		and poin24.valuation_type = 'PEPRODUCT'
+	THEN 
+		(CASE
+			when poin24.manufacturer_code = 'PE' THEN mbew.STPRS
+			when poin24.manufacturer_code = 'PX' THEN mbew1.STPRS
+			else 0
+		END) - 
+		(CASE
+			WHEN poin24.valuation_type not IN ('PXPRODUCT','PEPRODUCT') THEN mbew2.STPRS
+			else 0
+		end)
+	WHEN poin24.current_status in ('OH','ST')
+		and poin24.manufacturer_code = 'PX'
+		and poin24.valuation_type = 'PXPRODUCT'
+	THEN
+		(CASE
+			when poin24.manufacturer_code = 'PE' THEN mbew.STPRS
+			when poin24.manufacturer_code = 'PX' THEN mbew1.STPRS
+			else 0
+		END)- isnull(mbew3.STPRS ,0)
+	else 0
+END AS product_only, --30
+CASE
+	WHEN poin24.current_status in ('OHC','STC')
+		and poin24.manufacturer_code = 'PX'
+		and poin24.valuation_type = 'PXBFAIL'
+	THEN mbew3.STPRS
+	WHEN poin24.current_status in ('OHC','STC')
+		and poin24.manufacturer_code = 'PX'
+		and poin24.valuation_type = 'PXSFAIL'
+	then mbew4.STPRS
+	when poin24.current_status in ('OHC','STC')
+		and poin24.manufacturer_code = 'PE'
+	then 
+		CASE
+			WHEN poin24.valuation_type not IN ('PXPRODUCT','PEPRODUCT') THEN mbew2.STPRS
+			else 0
+		end
+	when poin24.current_status in ('OHC','STC')
+		and poin24.manufacturer_code = 'PX'
+		and poin24.valuation_type = 'PXPRODUCT'
+	then 
+		CASE
+			when poin24.manufacturer_code = 'PE' THEN mbew.STPRS
+			when poin24.manufacturer_code = 'PX' THEN mbew1.STPRS
+			else 0
+		END
+	else 0
+end as core_only, -- 31
+iif(acv.answl in (0 , null), acv.answl , acv.answl - dep.nafag) fixed_asset --32
+from poin24
+-- staging to point 24
+
+
+left join EQUI EQUI
+on EQUI.matnr = poin24.matnr
+and EQUI.b_werk = poin24.plant
+and EQUI.B_LAGER = poin24.storage_location
+and equi.B_CHARGE = poin24.valuation_type
+and EQUI.row_num = poin24.row_num
+left join EDW_STG_SAP_ECC_DAILY..EQUZ EQUZ
+	on equz.EQUNR = iif(poin24.dupe_tuid = 1 , coalesce(poin24.EQUNR , EQUI.equnr) , EQUI.equnr)
+left join EDW_STG_SAP_ECC_DAILY..ILOA ILOA
+	on ILOA.ILOAN = EQUZ.ILOAN
+left join EDW_STG_SAP_ECC_DAILY..mbew mbew
+	on mbew.MATNR = poin24.MATNR
+	and mbew.BWKEY = poin24.plant
+	and mbew.BWTAR = 'PEPRODUCT'
+left join EDW_STG_SAP_ECC_DAILY..mbew mbew1
+	on mbew1.MATNR = poin24.MATNR
+	and mbew1.BWKEY = poin24.plant
+	and mbew1.BWTAR = 'PXPRODUCT'
+left join EDW_STG_SAP_ECC_DAILY..mbew mbew2
+	on mbew2.MATNR = poin24.MATNR
+	and mbew2.BWKEY = poin24.plant
+	and mbew2.BWTAR = poin24.valuation_type
+	and mbew2.BWTAR not in ('PEPRODUCT' , 'PXPRODUCT')
+left join EDW_STG_SAP_ECC_DAILY..mbew mbew3
+	on mbew3.MATNR = poin24.MATNR
+	and mbew3.BWKEY = poin24.plant
+	and mbew3.BWTAR = 'PXBFAIL'
+left join EDW_STG_SAP_ECC_DAILY..mbew mbew4
+	on mbew4.MATNR = poin24.MATNR
+	and mbew4.BWKEY = poin24.plant
+	and mbew4.BWTAR = 'PXSFAIL'
+left join acv acv
+	on acv.anln1 = ILOa.ANLNR
+		and acv.anln2 = iloa.anlun
+		and acv.afabe = '1'
+		and acv.bukrs = 1000
+left join dep dep
+	on dep.ANLN1 = iloa.ANLNR
+	and dep.ANLN2 = iloa.ANLUN
+	and dep.AFABE = '1'
+	and dep.BUKRS = 1000
+where poin24.manufacturer_code in ('PE' , 'PX')
+and poin24.current_status in ('OH' , 'OHC', 'WIP', 'WOC', 'STC' , 'ST')
+and not poin24.storage_location = 'SCRP'
